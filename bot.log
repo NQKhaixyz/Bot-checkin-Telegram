@@ -1,0 +1,17 @@
+2025-12-22 15:21:41,617 - __main__ - INFO - ==================================================
+2025-12-22 15:21:41,617 - __main__ - INFO - Starting Telegram Attendance Bot...
+2025-12-22 15:21:41,617 - __main__ - INFO - Database: sqlite:///./attendance.db
+2025-12-22 15:21:41,618 - __main__ - INFO - Timezone: Asia/Ho_Chi_Minh
+2025-12-22 15:21:41,618 - __main__ - INFO - Work start: 17:45
+2025-12-22 15:21:41,618 - __main__ - INFO - Late threshold: 1440 minutes
+2025-12-22 15:21:41,618 - __main__ - INFO - Geofence radius: 50.0m
+2025-12-22 15:21:41,618 - __main__ - INFO - Super admins: [5934905697]
+2025-12-22 15:21:41,618 - __main__ - INFO - ==================================================
+2025-12-22 15:21:41,618 - __main__ - INFO - Creating bot application...
+2025-12-22 15:21:42,003 - __main__ - INFO - Bot is running. Press Ctrl+C to stop.
+2025-12-22 15:21:42,837 - telegram.ext.Application - INFO - Application started
+trl+C to stop.
+2025-12-22 15:21:42,508 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2025-12-22 15:21:42,509 - telegram.ext.Application - INFO - Application.stop() complete
+2025-12-22 15:21:42,511 - __main__ - INFO - Bot shutdown complete.
+2025-12-22 15:21:42,837 - telegram.ext.Application - INFO - Application started

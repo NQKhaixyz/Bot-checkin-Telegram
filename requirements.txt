@@ -1,0 +1,11 @@
+# Core dependencies
+python-telegram-bot>=20.7
+sqlalchemy>=2.0.23
+python-dotenv>=1.0.0
+pytz>=2023.3
+
+# Geolocation
+geopy>=2.4.1
+
+# Excel export
+openpyxl>=3.1.2
