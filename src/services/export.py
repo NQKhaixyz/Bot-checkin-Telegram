@@ -22,10 +22,16 @@ from src.config import get_config
 from src.database import (
     AttendanceLog,
     AttendanceType,
+    PointLog,
     User,
     UserStatus,
     get_db_session,
 )
+
+
+def _get_is_late(log, fallback: bool = False) -> bool:
+    """Safely read is_late flag from AttendanceLog (older rows may not have attribute)."""
+    return getattr(log, "is_late", fallback)
 
 
 @dataclass
@@ -64,6 +70,20 @@ class MonthlyReportData:
     month: int
     employee_data: List[EmployeeMonthlyData] = field(default_factory=list)
     summary: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class MonthlyPointRow:
+    """Điểm tháng theo từng nguồn của một user."""
+    
+    user_id: int
+    full_name: str
+    total_points: int
+    meeting_points: int
+    evidence_points: int
+    penalty_points: int
+    absence_points: int
+    other_points: int
 
 
 class ExportService:
@@ -171,14 +191,20 @@ class ExportService:
             for user_id, log in user_check_ins.items():
                 user_name = user_map.get(user_id, f"User {user_id}")
                 check_in_time = log.timestamp
-                is_late = log.is_late or check_in_time > late_threshold
+                # Ensure timezone-aware for comparison
+                check_in_local = (
+                    check_in_time.astimezone(tz)
+                    if check_in_time.tzinfo
+                    else tz.localize(check_in_time)
+                )
+                is_late = _get_is_late(log) or check_in_local > late_threshold
 
-                present_users.append((user_name, check_in_time, is_late))
+                present_users.append((user_name, check_in_local, is_late))
 
                 if is_late:
                     late += 1
-                    late_minutes = int((check_in_time - work_start).total_seconds() / 60)
-                    late_users.append((user_name, check_in_time, max(0, late_minutes)))
+                    late_minutes = int((check_in_local - work_start).total_seconds() / 60)
+                    late_users.append((user_name, check_in_local, max(0, late_minutes)))
                 else:
                     on_time += 1
 
@@ -260,370 +286,194 @@ class ExportService:
         return "\n".join(lines)
 
     @staticmethod
-    def _get_monthly_data(year: int, month: int) -> MonthlyReportData:
+    def _get_monthly_points(year: int, month: int) -> List[MonthlyPointRow]:
         """
-        Get monthly attendance data for all employees.
-
-        Args:
-            year: The year to generate the report for.
-            month: The month to generate the report for.
-
-        Returns:
-            MonthlyReportData containing attendance data for the month.
+        Lấy điểm tháng của từng user, phân loại theo nguồn điểm.
         """
-        config = get_config()
-        tz = pytz.timezone(config.timezone.timezone)
-
-        # Get the number of days in the month
-        _, num_days = monthrange(year, month)
-
-        # Define month boundaries
-        month_start = tz.localize(datetime(year, month, 1, 0, 0, 0))
-        if month == 12:
-            month_end = tz.localize(datetime(year + 1, 1, 1, 0, 0, 0)) - timedelta(seconds=1)
-        else:
-            month_end = tz.localize(datetime(year, month + 1, 1, 0, 0, 0)) - timedelta(seconds=1)
-
-        # Work start time for late calculation
-        work_start_time = time(config.attendance.work_start_hour, config.attendance.work_start_minute)
-
         with get_db_session() as session:
-            # Get all active employees
             active_users = (
                 session.query(User)
                 .filter(User.status == UserStatus.ACTIVE)
                 .order_by(User.full_name)
                 .all()
             )
-
-            # Get all attendance logs for the month
-            logs = (
-                session.query(AttendanceLog)
-                .filter(
-                    and_(
-                        AttendanceLog.timestamp >= month_start,
-                        AttendanceLog.timestamp <= month_end,
-                    )
+            
+            point_sums = (
+                session.query(
+                    PointLog.user_id,
+                    PointLog.source_type,
+                    func.sum(PointLog.points).label("points"),
                 )
-                .order_by(AttendanceLog.timestamp)
+                .filter(
+                    PointLog.month == month,
+                    PointLog.year == year,
+                )
+                .group_by(PointLog.user_id, PointLog.source_type)
                 .all()
             )
-
-            # Organize logs by user and day
-            user_logs: Dict[int, Dict[int, Dict[str, List[AttendanceLog]]]] = {}
-            for log in logs:
-                user_id = log.user_id
-                local_time = log.timestamp.astimezone(tz) if log.timestamp.tzinfo else tz.localize(log.timestamp)
-                day = local_time.day
-                log_type = log.type.value if isinstance(log.type, AttendanceType) else log.type
-
-                if user_id not in user_logs:
-                    user_logs[user_id] = {}
-                if day not in user_logs[user_id]:
-                    user_logs[user_id][day] = {"IN": [], "OUT": []}
-                user_logs[user_id][day][log_type].append(log)
-
-            # Build employee data
-            employee_data: List[EmployeeMonthlyData] = []
-            total_present = 0
-            total_late = 0
-
+            
+            # Map user_id -> source_type -> points
+            point_map: Dict[int, Dict[str, int]] = {}
+            for user_id, source_type, points in point_sums:
+                if user_id not in point_map:
+                    point_map[user_id] = {}
+                point_map[user_id][source_type] = points or 0
+            
+            rows: List[MonthlyPointRow] = []
             for user in active_users:
-                emp_data = EmployeeMonthlyData(
-                    user_id=user.user_id,
-                    full_name=user.full_name,
-                    daily_records={},
+                src_points = point_map.get(user.user_id, {})
+                meeting = src_points.get("meeting", 0)
+                evidence = src_points.get("evidence", 0)
+                penalty = src_points.get("penalty", 0)
+                absence = src_points.get("absence", 0)
+                
+                other = 0
+                for src, val in src_points.items():
+                    if src not in {"meeting", "evidence", "penalty", "absence"}:
+                        other += val
+                
+                total = meeting + evidence + penalty + absence + other
+                
+                rows.append(
+                    MonthlyPointRow(
+                        user_id=user.user_id,
+                        full_name=user.full_name,
+                        total_points=total,
+                        meeting_points=meeting,
+                        evidence_points=evidence,
+                        penalty_points=penalty,
+                        absence_points=absence,
+                        other_points=other,
+                    )
                 )
-
-                user_day_logs = user_logs.get(user.user_id, {})
-
-                for day in range(1, num_days + 1):
-                    day_logs = user_day_logs.get(day, {"IN": [], "OUT": []})
-
-                    # Get earliest check-in
-                    check_in: Optional[datetime] = None
-                    is_late = False
-                    if day_logs["IN"]:
-                        earliest_in = min(day_logs["IN"], key=lambda x: x.timestamp)
-                        check_in = earliest_in.timestamp
-                        is_late = earliest_in.is_late
-
-                        # Also calculate late based on work start time
-                        local_check_in = check_in.astimezone(tz) if check_in.tzinfo else tz.localize(check_in)
-                        work_start_dt = tz.localize(datetime.combine(date(year, month, day), work_start_time))
-                        late_threshold = work_start_dt + timedelta(minutes=config.attendance.late_threshold_minutes)
-
-                        if local_check_in > late_threshold:
-                            is_late = True
-                            late_minutes = int((local_check_in - work_start_dt).total_seconds() / 60)
-                            emp_data.total_late_minutes += max(0, late_minutes)
-
-                    # Get latest check-out
-                    check_out: Optional[datetime] = None
-                    if day_logs["OUT"]:
-                        latest_out = max(day_logs["OUT"], key=lambda x: x.timestamp)
-                        check_out = latest_out.timestamp
-
-                    emp_data.daily_records[day] = (check_in, check_out, is_late)
-
-                    if check_in:
-                        emp_data.total_days_present += 1
-                        if is_late:
-                            emp_data.late_days += 1
-
-                total_present += emp_data.total_days_present
-                total_late += emp_data.late_days
-                employee_data.append(emp_data)
-
-            summary = {
-                "total_employees": len(active_users),
-                "total_working_days": num_days,
-                "total_present": total_present,
-                "total_late": total_late,
-            }
-
-            return MonthlyReportData(
-                year=year,
-                month=month,
-                employee_data=employee_data,
-                summary=summary,
-            )
+            
+            # Sắp xếp theo tổng điểm giảm dần
+            rows.sort(key=lambda r: r.total_points, reverse=True)
+            return rows
 
     @staticmethod
     def generate_monthly_excel(year: int, month: int) -> io.BytesIO:
         """
-        Generate monthly Excel report with summary and detail sheets.
-
-        Args:
-            year: The year to generate the report for.
-            month: The month to generate the report for.
-
-        Returns:
-            BytesIO containing the Excel workbook.
+        Generate monthly Excel report focusing on points (không tính đi muộn).
+        Columns: User, Tổng điểm, Meeting, Evidence, Penalty, Absence, Khác.
         """
-        config = get_config()
-        tz = pytz.timezone(config.timezone.timezone)
-        _, num_days = monthrange(year, month)
-
-        # Get monthly data
-        report_data = ExportService._get_monthly_data(year, month)
-
-        # Create workbook
+        point_rows = ExportService._get_monthly_points(year, month)
+        
         wb = Workbook()
-
-        # ============ Sheet 1: Summary (Tóm tắt) ============
-        ws_summary = wb.active
-        ws_summary.title = "Tóm tắt"
-
+        ws = wb.active
+        ws.title = "Điểm tháng"
+        
         # Title
-        ws_summary.merge_cells("A1:E1")
-        ws_summary["A1"] = f"BÁO CÁO CHẤM CÔNG THÁNG {month:02d}/{year}"
-        ws_summary["A1"].font = Font(bold=True, size=14)
-        ws_summary["A1"].alignment = Alignment(horizontal="center")
-
-        # Headers
-        headers = ["STT", "Họ và tên", "Số ngày làm việc", "Số ngày đi muộn", "Tổng phút đi muộn"]
+        ws.merge_cells("A1:H1")
+        ws["A1"] = f"ĐIỂM THÁNG {month:02d}/{year}"
+        ws["A1"].font = Font(bold=True, size=14)
+        ws["A1"].alignment = Alignment(horizontal="center")
+        
+        headers = [
+            "STT",
+            "Họ và tên",
+            "Tổng điểm",
+            "Meeting",
+            "Evidence",
+            "Penalty",
+            "Absence",
+            "Khác",
+        ]
+        
         for col, header in enumerate(headers, 1):
-            cell = ws_summary.cell(row=3, column=col, value=header)
+            cell = ws.cell(row=3, column=col, value=header)
             cell.fill = ExportService.HEADER_FILL
             cell.font = ExportService.HEADER_FONT
             cell.border = ExportService.THIN_BORDER
             cell.alignment = Alignment(horizontal="center")
-
-        # Data rows
-        for idx, emp in enumerate(report_data.employee_data, 1):
-            row = idx + 3
-            ws_summary.cell(row=row, column=1, value=idx).border = ExportService.THIN_BORDER
-            ws_summary.cell(row=row, column=2, value=emp.full_name).border = ExportService.THIN_BORDER
-            ws_summary.cell(row=row, column=3, value=emp.total_days_present).border = ExportService.THIN_BORDER
+        
+        total_points = total_meeting = total_evidence = 0
+        total_penalty = total_absence = total_other = 0
+        
+        for idx, row_data in enumerate(point_rows, 1):
+            r = idx + 3
+            ws.cell(row=r, column=1, value=idx).border = ExportService.THIN_BORDER
+            ws.cell(row=r, column=2, value=row_data.full_name).border = ExportService.THIN_BORDER
+            ws.cell(row=r, column=3, value=row_data.total_points).border = ExportService.THIN_BORDER
+            ws.cell(row=r, column=4, value=row_data.meeting_points).border = ExportService.THIN_BORDER
+            ws.cell(row=r, column=5, value=row_data.evidence_points).border = ExportService.THIN_BORDER
+            ws.cell(row=r, column=6, value=row_data.penalty_points).border = ExportService.THIN_BORDER
+            ws.cell(row=r, column=7, value=row_data.absence_points).border = ExportService.THIN_BORDER
+            ws.cell(row=r, column=8, value=row_data.other_points).border = ExportService.THIN_BORDER
             
-            late_cell = ws_summary.cell(row=row, column=4, value=emp.late_days)
-            late_cell.border = ExportService.THIN_BORDER
-            if emp.late_days > 0:
-                late_cell.fill = ExportService.LATE_FILL
-
-            minutes_cell = ws_summary.cell(row=row, column=5, value=emp.total_late_minutes)
-            minutes_cell.border = ExportService.THIN_BORDER
-            if emp.total_late_minutes > 0:
-                minutes_cell.fill = ExportService.LATE_FILL
-
-        # Adjust column widths
-        ws_summary.column_dimensions["A"].width = 6
-        ws_summary.column_dimensions["B"].width = 25
-        ws_summary.column_dimensions["C"].width = 18
-        ws_summary.column_dimensions["D"].width = 18
-        ws_summary.column_dimensions["E"].width = 18
-
-        # ============ Sheet 2: Detail (Chi tiết) ============
-        ws_detail = wb.create_sheet("Chi tiết")
-
-        # Title
-        title_end_col = len(report_data.employee_data) * 2 + 1
-        ws_detail.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(title_end_col, 5))
-        ws_detail["A1"] = f"CHI TIẾT CHẤM CÔNG THÁNG {month:02d}/{year}"
-        ws_detail["A1"].font = Font(bold=True, size=14)
-        ws_detail["A1"].alignment = Alignment(horizontal="center")
-
-        # Column headers - Date column + Employee columns (2 sub-columns each: In/Out)
-        ws_detail.cell(row=3, column=1, value="Ngày").fill = ExportService.HEADER_FILL
-        ws_detail.cell(row=3, column=1).font = ExportService.HEADER_FONT
-        ws_detail.cell(row=3, column=1).border = ExportService.THIN_BORDER
-        ws_detail.cell(row=3, column=1).alignment = Alignment(horizontal="center")
-
-        col = 2
-        for emp in report_data.employee_data:
-            # Merge cells for employee name
-            ws_detail.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col + 1)
-            name_cell = ws_detail.cell(row=2, column=col, value=emp.full_name)
-            name_cell.fill = ExportService.HEADER_FILL
-            name_cell.font = ExportService.HEADER_FONT
-            name_cell.border = ExportService.THIN_BORDER
-            name_cell.alignment = Alignment(horizontal="center")
-
-            # In/Out sub-headers
-            in_cell = ws_detail.cell(row=3, column=col, value="Vào")
-            in_cell.fill = ExportService.HEADER_FILL
-            in_cell.font = ExportService.HEADER_FONT
-            in_cell.border = ExportService.THIN_BORDER
-            in_cell.alignment = Alignment(horizontal="center")
-
-            out_cell = ws_detail.cell(row=3, column=col + 1, value="Ra")
-            out_cell.fill = ExportService.HEADER_FILL
-            out_cell.font = ExportService.HEADER_FONT
-            out_cell.border = ExportService.THIN_BORDER
-            out_cell.alignment = Alignment(horizontal="center")
-
-            col += 2
-
-        # Data rows - one row per day
-        for day in range(1, num_days + 1):
-            row = day + 3
-            current_date = date(year, month, day)
-
-            # Date column
-            date_cell = ws_detail.cell(row=row, column=1, value=current_date.strftime("%d/%m"))
-            date_cell.border = ExportService.THIN_BORDER
-            date_cell.alignment = Alignment(horizontal="center")
-
-            # Employee data
-            col = 2
-            for emp in report_data.employee_data:
-                check_in, check_out, is_late = emp.daily_records.get(day, (None, None, False))
-
-                # Check-in time
-                in_value = ""
-                if check_in:
-                    local_in = check_in.astimezone(tz) if check_in.tzinfo else tz.localize(check_in)
-                    in_value = local_in.strftime("%H:%M")
-
-                in_cell = ws_detail.cell(row=row, column=col, value=in_value)
-                in_cell.border = ExportService.THIN_BORDER
-                in_cell.alignment = Alignment(horizontal="center")
-                
-                if is_late and check_in:
-                    in_cell.fill = ExportService.LATE_FILL
-                elif not check_in:
-                    in_cell.fill = ExportService.ABSENT_FILL
-
-                # Check-out time
-                out_value = ""
-                if check_out:
-                    local_out = check_out.astimezone(tz) if check_out.tzinfo else tz.localize(check_out)
-                    out_value = local_out.strftime("%H:%M")
-
-                out_cell = ws_detail.cell(row=row, column=col + 1, value=out_value)
-                out_cell.border = ExportService.THIN_BORDER
-                out_cell.alignment = Alignment(horizontal="center")
-                
-                if not check_out and check_in:
-                    out_cell.fill = ExportService.ABSENT_FILL
-
-                col += 2
-
-        # Adjust column widths for detail sheet
-        ws_detail.column_dimensions["A"].width = 10
-        for col_idx in range(2, len(report_data.employee_data) * 2 + 2):
-            ws_detail.column_dimensions[get_column_letter(col_idx)].width = 8
-
-        # Save to BytesIO
+            total_points += row_data.total_points
+            total_meeting += row_data.meeting_points
+            total_evidence += row_data.evidence_points
+            total_penalty += row_data.penalty_points
+            total_absence += row_data.absence_points
+            total_other += row_data.other_points
+        
+        total_row = len(point_rows) + 4
+        ws.cell(row=total_row, column=1, value="Tổng").font = Font(bold=True)
+        ws.cell(row=total_row, column=1).border = ExportService.THIN_BORDER
+        ws.cell(row=total_row, column=3, value=total_points).border = ExportService.THIN_BORDER
+        ws.cell(row=total_row, column=4, value=total_meeting).border = ExportService.THIN_BORDER
+        ws.cell(row=total_row, column=5, value=total_evidence).border = ExportService.THIN_BORDER
+        ws.cell(row=total_row, column=6, value=total_penalty).border = ExportService.THIN_BORDER
+        ws.cell(row=total_row, column=7, value=total_absence).border = ExportService.THIN_BORDER
+        ws.cell(row=total_row, column=8, value=total_other).border = ExportService.THIN_BORDER
+        
+        # Widths
+        ws.column_dimensions["A"].width = 6
+        ws.column_dimensions["B"].width = 28
+        for col_letter in ["C", "D", "E", "F", "G", "H"]:
+            ws.column_dimensions[col_letter].width = 14
+        
         output = io.BytesIO()
         wb.save(output)
         output.seek(0)
-
         return output
 
     @staticmethod
     def generate_csv_report(year: int, month: int) -> str:
         """
-        Generate monthly CSV report.
-
-        Args:
-            year: The year to generate the report for.
-            month: The month to generate the report for.
-
-        Returns:
-            CSV string containing the monthly attendance data.
+        Generate monthly CSV report focusing on points.
         """
-        config = get_config()
-        tz = pytz.timezone(config.timezone.timezone)
-        _, num_days = monthrange(year, month)
-
-        # Get monthly data
-        report_data = ExportService._get_monthly_data(year, month)
-
-        # Create CSV in memory
+        point_rows = ExportService._get_monthly_points(year, month)
+        
         output = io.StringIO()
         writer = csv.writer(output)
-
-        # Header row 1: Title
-        writer.writerow([f"Báo cáo chấm công tháng {month:02d}/{year}"])
+        
+        writer.writerow([f"Điểm tháng {month:02d}/{year}"])
         writer.writerow([])
-
-        # Header row 2: Column headers
-        headers = ["Ngày"]
-        for emp in report_data.employee_data:
-            headers.extend([f"{emp.full_name} - Vào", f"{emp.full_name} - Ra"])
-        writer.writerow(headers)
-
-        # Data rows
-        for day in range(1, num_days + 1):
-            current_date = date(year, month, day)
-            row = [current_date.strftime("%d/%m/%Y")]
-
-            for emp in report_data.employee_data:
-                check_in, check_out, is_late = emp.daily_records.get(day, (None, None, False))
-
-                # Check-in time
-                if check_in:
-                    local_in = check_in.astimezone(tz) if check_in.tzinfo else tz.localize(check_in)
-                    in_value = local_in.strftime("%H:%M")
-                    if is_late:
-                        in_value += " (muộn)"
-                else:
-                    in_value = ""
-
-                # Check-out time
-                if check_out:
-                    local_out = check_out.astimezone(tz) if check_out.tzinfo else tz.localize(check_out)
-                    out_value = local_out.strftime("%H:%M")
-                else:
-                    out_value = ""
-
-                row.extend([in_value, out_value])
-
-            writer.writerow(row)
-
-        # Summary section
-        writer.writerow([])
-        writer.writerow(["TÓM TẮT"])
-        writer.writerow(["STT", "Họ và tên", "Số ngày làm việc", "Số ngày đi muộn", "Tổng phút đi muộn"])
-        for idx, emp in enumerate(report_data.employee_data, 1):
+        writer.writerow(["STT", "Họ và tên", "Tổng điểm", "Meeting", "Evidence", "Penalty", "Absence", "Khác"])
+        
+        total_points = total_meeting = total_evidence = 0
+        total_penalty = total_absence = total_other = 0
+        
+        for idx, row_data in enumerate(point_rows, 1):
             writer.writerow([
                 idx,
-                emp.full_name,
-                emp.total_days_present,
-                emp.late_days,
-                emp.total_late_minutes,
+                row_data.full_name,
+                row_data.total_points,
+                row_data.meeting_points,
+                row_data.evidence_points,
+                row_data.penalty_points,
+                row_data.absence_points,
+                row_data.other_points,
             ])
-
+            total_points += row_data.total_points
+            total_meeting += row_data.meeting_points
+            total_evidence += row_data.evidence_points
+            total_penalty += row_data.penalty_points
+            total_absence += row_data.absence_points
+            total_other += row_data.other_points
+        
+        writer.writerow([])
+        writer.writerow([
+            "Tổng",
+            "",
+            total_points,
+            total_meeting,
+            total_evidence,
+            total_penalty,
+            total_absence,
+            total_other,
+        ])
+        
         return output.getvalue()

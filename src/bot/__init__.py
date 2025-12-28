@@ -69,11 +69,9 @@ def _register_handlers(app: Application) -> None:
     from src.bot.handlers.start import registration_conversation
     from src.bot.handlers.location import location_setup_conversation
     from src.bot.handlers.checkin import (
-        checkin_command,
+        checkin_conversation,
         checkout_command,
-        location_handler,
         status_command,
-        history_command,
     )
     from src.bot.handlers.admin import (
         approve_command,
@@ -90,7 +88,12 @@ def _register_handlers(app: Application) -> None:
         admin_callback_handler,
         list_locations_command,
         delete_location_command,
+        delete_meeting_command,
+        list_meetings_command,
+        ranking_command,
+        set_meeting_handler,
     )
+    from src.bot.handlers.evidence import evidence_conversation
     from src.bot.handlers.help import help_command, ngocminh_command, ngocminh_callback_handler
     from src.bot.handlers.menu import text_message_handler
     
@@ -104,14 +107,21 @@ def _register_handlers(app: Application) -> None:
     # Location setup conversation (handles /set_location flow)
     app.add_handler(location_setup_conversation)
     
+    # Check-in conversation (handles /checkin, "Diem danh" button, and location verification)
+    app.add_handler(checkin_conversation)
+    
+    # Evidence conversation (handles /minhchung)
+    app.add_handler(evidence_conversation)
+    
+    # Set meeting conversation (handles /set_meeting for admin)
+    app.add_handler(set_meeting_handler)
+    
     # =========================================================================
     # COMMAND HANDLERS - User commands
     # =========================================================================
     
-    app.add_handler(CommandHandler("checkin", checkin_command))
     app.add_handler(CommandHandler("checkout", checkout_command))
     app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("ngocminh", ngocminh_command))
     
@@ -128,21 +138,20 @@ def _register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("list_locations", list_locations_command))
     app.add_handler(CommandHandler("list_location", list_locations_command))  # Alias without 's'
     app.add_handler(CommandHandler("delete_location", delete_location_command))
+    app.add_handler(CommandHandler("delete_meeting", delete_meeting_command))
     app.add_handler(CommandHandler("today", today_command))
+    app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("export_excel", export_command))
+    app.add_handler(CommandHandler("exports", export_command))  # Common typo/alias
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("help_admin", help_admin_command))
+    app.add_handler(CommandHandler("list_meetings", list_meetings_command))
+    app.add_handler(CommandHandler("ranking", ranking_command))
     
     # =========================================================================
     # MESSAGE HANDLERS
     # =========================================================================
-    
-    # Location handler (for check-in/check-out GPS)
-    app.add_handler(MessageHandler(
-        filters.LOCATION,
-        location_handler
-    ))
     
     # Text message handler for menu buttons
     app.add_handler(MessageHandler(

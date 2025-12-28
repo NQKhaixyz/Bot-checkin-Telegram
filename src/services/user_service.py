@@ -310,6 +310,20 @@ class UserService:
         return list(admin_ids)
     
     @staticmethod
+    def get_admin_users() -> List[User]:
+        """
+        Get all users with admin role from database.
+        
+        Returns:
+            List of User objects with admin role.
+        """
+        with get_db_session() as db:
+            users = db.query(User).filter(User.role == UserRole.ADMIN).all()
+            for user in users:
+                db.expunge(user)
+            return users
+    
+    @staticmethod
     def get_user_stats() -> Dict[str, int]:
         """
         Get user statistics.

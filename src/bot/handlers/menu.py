@@ -9,12 +9,11 @@ from telegram.ext import ContextTypes
 
 from src.constants import KeyboardLabels
 from src.bot.handlers.checkin import (
-    checkin_command,
     checkout_command,
     status_command,
-    history_command,
     cancel_action
 )
+from src.bot.handlers.evidence import minhchung_command
 
 
 async def text_message_handler(
@@ -29,15 +28,13 @@ async def text_message_handler(
     text = update.message.text
     
     # User menu handlers
+    # Note: KeyboardLabels.CHECKIN ("Diem danh") is handled by checkin_conversation
     user_handlers = {
-        KeyboardLabels.CHECKIN: checkin_command,
-        "📥 Check-in": checkin_command,
         KeyboardLabels.CHECKOUT: checkout_command,
         "📤 Check-out": checkout_command,
         KeyboardLabels.STATUS: status_command,
         "📊 Trạng thái": status_command,
-        KeyboardLabels.HISTORY: history_command,
-        "📜 Lịch sử": history_command,
+        KeyboardLabels.MINHCHUNG: minhchung_command,
         KeyboardLabels.CANCEL: cancel_action,
         "❌ Hủy": cancel_action,
     }
@@ -52,10 +49,11 @@ async def text_message_handler(
     from src.bot.handlers.admin import (
         list_pending_command,
         list_users_command,
-        list_locations_command,
         today_command,
         export_command,
         broadcast_command,
+        list_meetings_command,
+        ranking_command,
     )
     
     admin_handlers = {
@@ -67,8 +65,8 @@ async def text_message_handler(
         "📊 Báo cáo hôm nay": today_command,
         KeyboardLabels.EXPORT: export_command,
         "📁 Xuất báo cáo": export_command,
-        KeyboardLabels.LOCATIONS: list_locations_command,
-        "📍 Vị trí": list_locations_command,
+        KeyboardLabels.MEETINGS: list_meetings_command,
+        KeyboardLabels.RANKING: ranking_command,
         KeyboardLabels.BROADCAST: broadcast_command,
         "📢 Thông báo": broadcast_command,
     }

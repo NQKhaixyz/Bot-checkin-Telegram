@@ -85,26 +85,34 @@ async def help_command(
     user = UserService.get_user(user_id)
     
     # Basic help for all users
-    basic_help = """📖 HƯỚNG DẪN - CLB ĐIỂM DANH 🔥
+    basic_help = """📖 HƯỚNG DẪN SỬ DỤNG BOT 🔥
 
-🏃 Điểm danh đi họp:
-  • Bấm "📥 Điểm danh" hoặc /checkin
-  • Gửi location GPS khi bot yêu cầu
-  • Tương tự cho Check-out
+🎯 LỆNH CƠ BẢN:
+  /checkin - Điểm danh (cần gửi GPS)
+  /checkout - Check-out & nhận điểm
+  /status - Xem điểm, rank, mức CC
+  /minhchung - Gửi minh chứng công việc
+  /ranking - Xem bảng xếp hạng tháng
+  /help - Xem hướng dẫn này
 
-📊 Xem thông tin:
-  /status - Status hôm nay
-  /history - History tháng này
+📊 HỆ THỐNG ĐIỂM:
+  +5đ  : Họp thường tại C1-101
+  +10đ : Hỗ trợ diễn giả
+  +15đ : Hoạt động ngoại khóa lớn
+  -3đ  : Không đạt quy chế check-in
+  -10đ : Đăng ký nhưng không tham gia
 
-⚠️ LƯU Ý:
-  • Phải ở đúng địa điểm họp mới điểm danh được nha!
-  • Đừng fake loc, Bot slay lắm! 🕵️💅
-  • Location phải gửi trong vòng 60 giây!
+⚠️ LƯU Ý QUAN TRỌNG:
+  • Phải CHECK-IN + CHECK-OUT mới có điểm!
+  • Phải ở ĐÚNG địa điểm mới check-in được!
+  • Điểm reset mỗi tháng
+  • Dưới 15 điểm/tháng = nâng cảnh báo!
+  • Đừng fake location, Bot anti-cheat! 🕵️
 
 🍵 Easter egg:
   /ngocminh - Có giỏi thì bấm đi? 😏
 
-💪 Good luck! Đừng có cúp họp nha! 😏🔥
+💪 Good luck! Đừng có cúp họp nha! 🔥
 """
     
     await update.message.reply_text(basic_help)

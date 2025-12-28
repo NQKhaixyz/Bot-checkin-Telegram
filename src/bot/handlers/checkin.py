@@ -1,358 +1,479 @@
 """
-Check-in and check-out command handlers.
+Check-in and check-out command handlers with location verification and point system.
 
-Handles the attendance recording flow including location requests
-and validation.
+Uses ConversationHandler for check-in flow with GPS location verification.
 """
 
 import logging
 from datetime import datetime
 
-from telegram import Update, Message
-from telegram.ext import ContextTypes
+from telegram import Update
+from telegram.ext import (
+    ContextTypes,
+    ConversationHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
 from src.services.attendance import AttendanceService
+from src.services.meeting_service import MeetingService
+from src.services.point_service import PointService
 from src.services.user_service import UserService
 from src.services.geolocation import GeolocationService
 from src.services.anti_cheat import AntiCheatService
-from src.database import User, Location
+from src.database import User
 from src.constants import Messages, KeyboardLabels
 from src.bot.keyboards import Keyboards
 from src.bot.middlewares import require_registration, require_active, log_action
-from src.bot.handlers.help import check_muted
-from src.config import config
 
 logger = logging.getLogger(__name__)
 
-# Store pending check-in/check-out state per user
-# Key: user_id, Value: "checkin" or "checkout"
-pending_actions = {}
+# Conversation states for checkin
+CHECKIN_SELECT_MEETING = 0
+CHECKIN_WAITING_FOR_LOCATION = 1
 
 
-# Ngày cho phép check-in: Thứ 2 (0) và Thứ 4 (2)
-ALLOWED_WEEKDAYS = [0, 2]  # Monday = 0, Wednesday = 2
+async def _get_user_for_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Helper to get user and validate for checkin. Returns (user, error_sent) tuple."""
+    user_id = update.effective_user.id
+    user = UserService.get_user(user_id)
+    
+    if not user:
+        await update.message.reply_text(
+            "Ban chua dang ky! Dung /start de dang ky.",
+            reply_markup=Keyboards.main_menu()
+        )
+        return None, True
+    
+    # Handle status as string or enum
+    status = user.status.value if hasattr(user.status, 'value') else str(user.status)
+    
+    if status != "active":
+        if status == "pending":
+            await update.message.reply_text(
+                Messages.REGISTRATION_PENDING,
+                reply_markup=Keyboards.main_menu()
+            )
+        elif status == "banned":
+            await update.message.reply_text(
+                Messages.ACCOUNT_BANNED,
+                reply_markup=Keyboards.main_menu()
+            )
+        else:
+            await update.message.reply_text(
+                f"Tai khoan cua ban dang o trang thai: {status}",
+                reply_markup=Keyboards.main_menu()
+            )
+        return None, True
+    
+    return user, False
 
-def get_vn_now():
-    """Get current time in Vietnam timezone."""
-    import pytz
-    vn_tz = pytz.timezone('Asia/Ho_Chi_Minh')
-    return datetime.now(vn_tz)
 
-def is_checkin_day() -> bool:
-    """Check if today is a valid check-in day (Monday or Wednesday) in Vietnam timezone."""
-    return get_vn_now().weekday() in ALLOWED_WEEKDAYS
-
-def is_after_work_start() -> bool:
-    """Check if current time is after work start time (17:45)."""
-    now_vn = get_vn_now()
-    work_start_hour = config.attendance.work_start_hour
-    work_start_minute = config.attendance.work_start_minute
-    current_minutes = now_vn.hour * 60 + now_vn.minute
-    work_start_minutes = work_start_hour * 60 + work_start_minute
-    return current_minutes >= work_start_minutes
-
-def get_weekday_name(weekday: int) -> str:
-    """Get Vietnamese weekday name."""
-    names = ["Thu 2", "Thu 3", "Thu 4", "Thu 5", "Thu 6", "Thu 7", "Chu Nhat"]
-    return names[weekday]
-
-
-@require_registration
-@require_active
-@log_action("request_checkin")
-async def checkin_command(
+async def checkin_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    user: User = None
-) -> None:
-    """
-    Handle /checkin command or "Check-in" button.
-    
-    Initiates the check-in flow by requesting user's location.
-    """
-    # Check if muted
-    if await check_muted(update):
-        return
+) -> int:
+    """Handle /checkin command or 'Diem danh' button - start check-in flow."""
+    user, error_sent = await _get_user_for_checkin(update, context)
+    if error_sent:
+        return ConversationHandler.END
     
     user_id = update.effective_user.id
     
-    # Check if today is a valid check-in day
-    if not is_checkin_day():
+    now = AttendanceService.get_current_time()
+    active_meetings = MeetingService.get_active_meetings(now.replace(tzinfo=None))
+    
+    if not active_meetings:
         await update.message.reply_text(
-            "🙄 Ủa bro? Hôm nay có họp đâu mà điểm danh?\n\n"
-            "📅 CLB chỉ họp Thứ 2 và Thứ 4 thôi nha!\n"
-            "🛋️ Về chill đi, đừng có chăm quá! 😴💀",
+            Messages.NO_ACTIVE_MEETING,
             reply_markup=Keyboards.main_menu()
         )
-        return
+        return ConversationHandler.END
     
-    # Check if it's after work start time
-    if not is_after_work_start():
+    # If multiple active meetings, let user pick
+    if len(active_meetings) > 1:
+        lines = ["Chon buoi hop de diem danh (nhap ID):\n"]
+        for m in active_meetings:
+            start_str = m.meeting_time.strftime('%H:%M')
+            end_str = m.end_time.strftime('%H:%M') if m.end_time else "N/A"
+            lines.append(f"{m.id}. {m.title} ({start_str}-{end_str})")
         await update.message.reply_text(
-            "⏰ Ê chưa tới giờ họp mà bro!\n\n"
-            "🌅 Sớm quá xá luôn! Họp lúc 17:45 cơ mà!\n"
-            "☕ Đi uống trà sữa đợi tí rồi quay lại nha! 🧋✨",
+            "\n".join(lines),
+            reply_markup=Keyboards.cancel_only()
+        )
+        context.user_data['checkin_meeting_options'] = {str(m.id): m for m in active_meetings}
+        return CHECKIN_SELECT_MEETING
+    
+    meeting = active_meetings[0]
+    
+    if AttendanceService.has_checked_in(user_id, meeting.id):
+        checkin_log = AttendanceService.get_checkin_log(user_id, meeting.id)
+        time_str = checkin_log.timestamp.strftime('%H:%M') if checkin_log else "N/A"
+        await update.message.reply_text(
+            Messages.CHECKIN_ALREADY.format(time=time_str),
             reply_markup=Keyboards.main_menu()
         )
-        return
+        return ConversationHandler.END
     
-    # Check if already checked in today
-    if AttendanceService.has_checked_in_today(user_id):
-        existing = AttendanceService.get_today_checkin(user_id)
-        await update.message.reply_text(
-            f"🙄 Bro ơi điểm danh rồi còn điểm chi nữa?\n\n"
-            f"🕐 Đã check lúc: {existing.timestamp.strftime('%H:%M')}\n\n"
-            f"🧠 7 giây quên luôn á? Goldfish brain real! 🐟💀"
-        )
-        return
+    context.user_data['checkin_meeting_id'] = meeting.id
+    context.user_data['checkin_meeting_title'] = meeting.title
+    context.user_data['checkin_meeting_location'] = meeting.location
     
-    # Check if any locations are configured
-    locations = GeolocationService.get_active_locations()
-    if not locations:
-        await update.message.reply_text(
-            "😱 Ủa chưa có địa điểm họp nào được set!\n\n"
-            "📍 Admin ơi quên config location rồi kìa! 💀"
-        )
-        return
-    
-    # Store pending action
-    pending_actions[user_id] = "checkin"
-    
-    # Request location
     await update.message.reply_text(
-        "📍 Gửi location để điểm danh nè bro!\n\n"
-        "⚠️ Đừng có fake loc nha, Bot slay lắm đó! 🕵️💅",
+        f"DIEM DANH: {meeting.title}\n\n"
+        f"Vui long gui vi tri GPS cua ban de xac nhan diem danh.\n"
+        f"Bam nut 'Gui vi tri' ben duoi.",
         reply_markup=Keyboards.request_location()
     )
+    
+    return CHECKIN_WAITING_FOR_LOCATION
+
+
+async def checkin_location_received(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    """Handle location message for check-in verification."""
+    user_id = update.effective_user.id
+    message = update.message
+    location = message.location
+    
+    if not location:
+        await update.message.reply_text(
+            "Khong nhan duoc vi tri! Vui long gui lai.",
+            reply_markup=Keyboards.request_location()
+        )
+        return CHECKIN_WAITING_FOR_LOCATION
+    
+    # Get stored meeting info
+    meeting_id = context.user_data.get('checkin_meeting_id')
+    meeting_title = context.user_data.get('checkin_meeting_title', 'Buoi hop')
+    meeting_location = context.user_data.get('checkin_meeting_location', '')
+    
+    if not meeting_id:
+        await update.message.reply_text(
+            "Phien diem danh da het han. Vui long thu lai.",
+            reply_markup=Keyboards.main_menu()
+        )
+        return ConversationHandler.END
+    
+    # Anti-cheat validation
+    anti_cheat_result = AntiCheatService.validate_location_message(message)
+    
+    if not anti_cheat_result.is_valid:
+        logger.warning(
+            f"Anti-cheat failed for user {user_id}: "
+            f"{anti_cheat_result.error_code} - {anti_cheat_result.error_message}"
+        )
+        await update.message.reply_text(
+            f"Loi xac thuc vi tri: {anti_cheat_result.error_message}",
+            reply_markup=Keyboards.main_menu()
+        )
+        # Clear context
+        context.user_data.pop('checkin_meeting_id', None)
+        context.user_data.pop('checkin_meeting_title', None)
+        context.user_data.pop('checkin_meeting_location', None)
+        return ConversationHandler.END
+    
+    # Geolocation validation
+    meeting = MeetingService.get_meeting(meeting_id)
+    if not meeting:
+        await update.message.reply_text(
+            "Buoi hop khong ton tai hoac da bi xoa.",
+            reply_markup=Keyboards.main_menu()
+        )
+        context.user_data.pop('checkin_meeting_id', None)
+        context.user_data.pop('checkin_meeting_title', None)
+        context.user_data.pop('checkin_meeting_location', None)
+        return ConversationHandler.END
+    
+    location_name = meeting_location
+    
+    now = AttendanceService.get_current_time().replace(tzinfo=None)
+    if meeting.meeting_time and meeting.meeting_time > now:
+        await update.message.reply_text(
+            "Buoi hop chua bat dau. Thu lai khi den gio hop.",
+            reply_markup=Keyboards.main_menu()
+        )
+        return ConversationHandler.END
+    if meeting.end_time and meeting.end_time < now:
+        await update.message.reply_text(
+            "Buoi hop da ket thuc. Khong the check-in.",
+            reply_markup=Keyboards.main_menu()
+        )
+        return ConversationHandler.END
+    
+    if meeting.latitude is not None and meeting.longitude is not None:
+        within_radius, distance = MeetingService.check_location_for_meeting(
+            meeting_id,
+            location.latitude,
+            location.longitude,
+        )
+        radius = meeting.radius if meeting.radius else 50.0
+        
+        if not within_radius:
+            await update.message.reply_text(
+                f"Ban dang o qua xa dia diem hop!\n\n"
+                f"Dia diem: {meeting.location}\n"
+                f"Khoang cach: {distance:.0f}m\n"
+                f"Ban kinh cho phep: {radius:.0f}m\n\n"
+                f"Vui long di den dung dia diem va thu lai.",
+                reply_markup=Keyboards.main_menu()
+            )
+            # Clear context
+            context.user_data.pop('checkin_meeting_id', None)
+            context.user_data.pop('checkin_meeting_title', None)
+            context.user_data.pop('checkin_meeting_location', None)
+            return ConversationHandler.END
+        
+        location_name = meeting.location
+    else:
+        geo_result = GeolocationService.check_location_for_checkin(
+            location.latitude,
+            location.longitude
+        )
+        
+        if not geo_result.within_radius:
+            # Location not within any valid radius
+            if geo_result.location:
+                distance_str = f"{geo_result.distance_meters:.0f}m"
+                await update.message.reply_text(
+                    f"Ban dang o qua xa dia diem hop!\n\n"
+                    f"Dia diem gan nhat: {geo_result.location.name}\n"
+                    f"Khoang cach: {distance_str}\n"
+                    f"Ban kinh cho phep: {geo_result.location.radius:.0f}m\n\n"
+                    f"Vui long di den dung dia diem va thu lai.",
+                    reply_markup=Keyboards.main_menu()
+                )
+            else:
+                await update.message.reply_text(
+                    "Khong tim thay dia diem hop nao!\n\n"
+                    "Vui long lien he admin de duoc ho tro.",
+                    reply_markup=Keyboards.main_menu()
+                )
+            # Clear context
+            context.user_data.pop('checkin_meeting_id', None)
+            context.user_data.pop('checkin_meeting_title', None)
+            context.user_data.pop('checkin_meeting_location', None)
+            return ConversationHandler.END
+        
+        location_name = geo_result.location.name if geo_result.location else meeting_location
+    
+    # Location valid - record check-in
+    result = AttendanceService.record_checkin(user_id, meeting_id)
+    
+    # Clear context
+    context.user_data.pop('checkin_meeting_id', None)
+    context.user_data.pop('checkin_meeting_title', None)
+    context.user_data.pop('checkin_meeting_location', None)
+    
+    if result.success:
+        time_str = result.attendance_log.timestamp.strftime('%H:%M')
+        await update.message.reply_text(
+            Messages.CHECKIN_SUCCESS.format(
+                time=time_str,
+                meeting=meeting_title,
+                location=location_name,
+            ),
+            reply_markup=Keyboards.main_menu()
+        )
+        logger.info(
+            f"User {user_id} checked in to meeting {meeting_id} "
+            f"at location {location_name} ({location.latitude}, {location.longitude})"
+        )
+    else:
+        await update.message.reply_text(
+            result.message,
+            reply_markup=Keyboards.main_menu()
+        )
+    
+    return ConversationHandler.END
+
+
+async def checkin_select_meeting(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    """Handle meeting selection when multiple active meetings."""
+    choice = (update.message.text or "").strip()
+    options = context.user_data.get('checkin_meeting_options', {})
+    meeting = options.get(choice)
+    
+    if not meeting:
+        await update.message.reply_text(
+            "ID khong hop le. Nhap lai ID buoi hop:",
+            reply_markup=Keyboards.cancel_only()
+        )
+        return CHECKIN_SELECT_MEETING
+    
+    user_id = update.effective_user.id
+    if AttendanceService.has_checked_in(user_id, meeting.id):
+        checkin_log = AttendanceService.get_checkin_log(user_id, meeting.id)
+        time_str = checkin_log.timestamp.strftime('%H:%M') if checkin_log else "N/A"
+        await update.message.reply_text(
+            Messages.CHECKIN_ALREADY.format(time=time_str),
+            reply_markup=Keyboards.main_menu()
+        )
+        return ConversationHandler.END
+    
+    context.user_data['checkin_meeting_id'] = meeting.id
+    context.user_data['checkin_meeting_title'] = meeting.title
+    context.user_data['checkin_meeting_location'] = meeting.location
+    context.user_data.pop('checkin_meeting_options', None)
+    
+    await update.message.reply_text(
+        f"DIEM DANH: {meeting.title}\n\n"
+        f"Gui GPS de xac nhan (bam 'Gui vi tri').",
+        reply_markup=Keyboards.request_location()
+    )
+    
+    return CHECKIN_WAITING_FOR_LOCATION
+
+
+async def checkin_cancel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    """Handle cancel during check-in flow."""
+    # Clear context
+    context.user_data.pop('checkin_meeting_id', None)
+    context.user_data.pop('checkin_meeting_title', None)
+    context.user_data.pop('checkin_meeting_location', None)
+    
+    await update.message.reply_text(
+        "Da huy diem danh!",
+        reply_markup=Keyboards.main_menu()
+    )
+    return ConversationHandler.END
+
+
+# Create the conversation handler for check-in
+checkin_conversation = ConversationHandler(
+    entry_points=[
+        CommandHandler("checkin", checkin_start),
+        MessageHandler(filters.Regex(f"^{KeyboardLabels.CHECKIN}$"), checkin_start),
+    ],
+    states={
+        CHECKIN_SELECT_MEETING: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, checkin_select_meeting),
+            MessageHandler(filters.Regex(f"^{KeyboardLabels.CANCEL}$"), checkin_cancel),
+        ],
+        CHECKIN_WAITING_FOR_LOCATION: [
+            MessageHandler(filters.LOCATION, checkin_location_received),
+            MessageHandler(filters.Regex(f"^{KeyboardLabels.CANCEL}$"), checkin_cancel),
+        ],
+    },
+    fallbacks=[
+        MessageHandler(filters.Regex(f"^{KeyboardLabels.CANCEL}$"), checkin_cancel),
+        CommandHandler("cancel", checkin_cancel),
+    ],
+    name="checkin_conversation",
+    persistent=False,
+)
 
 
 @require_registration
 @require_active
-@log_action("request_checkout")
+@log_action("checkout")
 async def checkout_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     user: User = None
 ) -> None:
-    """
-    Handle /checkout command or "Check-out" button.
-    
-    Initiates the check-out flow by requesting user's location.
-    """
-    # Check if muted
-    if await check_muted(update):
-        return
-    
+    """Handle /checkout command - Check-out va nhan diem (no location verification needed)."""
     user_id = update.effective_user.id
     
-    # Check if checked in today
-    if not AttendanceService.has_checked_in_today(user_id):
+    # Get active meeting
+    meeting = MeetingService.get_active_meeting()
+    
+    if not meeting:
         await update.message.reply_text(
-            "🤨 Ủa? Check-out cái gì? Bro chưa điểm danh mà!\n\n"
-            "🛏️ Đừng nói là cúp họp nằm nhà nha? Real sussy đó! 😏💀"
+            Messages.NO_ACTIVE_MEETING,
+            reply_markup=Keyboards.main_menu()
         )
         return
     
-    # Check if already checked out today
-    if AttendanceService.has_checked_out_today(user_id):
+    # Check if already checked in
+    if not AttendanceService.has_checked_in(user_id, meeting.id):
         await update.message.reply_text(
-            "🙄 Bro check-out rồi còn check chi nữa?\n\n"
-            "🏠 Go home bro! Sao vẫn còn ở đây? 🤔💀"
+            Messages.CHECKOUT_NOT_CHECKED_IN,
+            reply_markup=Keyboards.main_menu()
         )
         return
     
-    # Store pending action
-    pending_actions[user_id] = "checkout"
+    # Record checkout
+    result = AttendanceService.record_checkout(user_id, meeting.id)
     
-    # Request location
-    await update.message.reply_text(
-        "📍 Gửi location để check-out nè!\n\n"
-        "🏃 Họp xong rồi hả? GG! 🎉",
-        reply_markup=Keyboards.request_location()
-    )
+    if result.success:
+        time_str = result.attendance_log.timestamp.strftime('%H:%M')
+        session_minutes = result.attendance_log.duration_minutes or 0
+        total_minutes = AttendanceService.get_total_minutes(user_id)
+        await update.message.reply_text(
+            f"Check-out thanh cong luc {time_str}!\n"
+            f"Diem: +{result.points_earned}\n"
+            f"Thoi gian hop: {int(session_minutes)} phut\n"
+            f"Tong thoi gian hop: {int(total_minutes)} phut",
+            reply_markup=Keyboards.main_menu()
+        )
+    else:
+        await update.message.reply_text(
+            result.message,
+            reply_markup=Keyboards.main_menu()
+        )
 
 
-async def location_handler(
+@require_registration
+@require_active
+async def status_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
+    user: User = None
 ) -> None:
     """
-    Handle location messages from users.
-    
-    Processes the location for check-in or check-out based on
-    the pending action state.
+    Handle /status command.
+    Gop status + history: Hien thi ten, diem thang, diem ky, rank, muc CC.
     """
     user_id = update.effective_user.id
-    message = update.message
-    location = message.location
+    user_data = UserService.get_user(user_id)
     
-    # Check if user is active
-    user = UserService.get_user(user_id)
-    user_status = user.status.value if hasattr(user.status, 'value') else str(user.status)
-    if not user or user_status != "active":
-        await message.reply_text(
-            "😅 Oof! Acc của bro chưa được kích hoạt!\n\n"
-            "⏳ Đợi Admin approve nha bestie! 🙏"
-        )
-        return
-    
-    # Check pending action
-    action = pending_actions.get(user_id)
-    if not action:
-        # No pending action, might be unsolicited location
-        await message.reply_text(
-            "🤔 Ủa bro gửi location làm gì vậy?\n\n"
-            "👆 Bấm nút Điểm danh hoặc Check-out trước rồi gửi nha!",
+    if not user_data:
+        await update.message.reply_text(
+            "Chua dang ky! Dung /start de dang ky.",
             reply_markup=Keyboards.main_menu()
         )
         return
     
-    # Clear pending action
-    del pending_actions[user_id]
+    # Get points and ranking info
+    ranking = PointService.get_user_ranking(user_id)
     
-    # =================================================================
-    # ANTI-CHEAT VALIDATION
-    # =================================================================
-    
-    # Check for forwarded message
-    validation = AntiCheatService.validate_location_message(message)
-    if not validation.is_valid:
-        await message.reply_text(
-            validation.error_message,
-            reply_markup=Keyboards.main_menu()
-        )
-        logger.warning(
-            f"Anti-cheat failed for user {user_id}: {validation.error_message}"
-        )
-        return
-    
-    # =================================================================
-    # LOCATION VERIFICATION
-    # =================================================================
-    
-    user_lat = location.latitude
-    user_lon = location.longitude
-    
-    # Find nearest office location
-    nearest = GeolocationService.find_nearest_location(user_lat, user_lon)
-    
-    if not nearest:
-        await message.reply_text(
-            "😱 Chưa có địa điểm họp nào được set!\n\n"
-            "📍 Admin ơi config đi! 💀",
-            reply_markup=Keyboards.main_menu()
-        )
-        return
-    
-    office_location, distance = nearest
-    
-    # Check if within radius
-    if distance > office_location.radius:
-        await message.reply_text(
-            f"❌ Ối dồi ôi! Vệ tinh báo bro đang ở Sao Hỏa à? 🚀💀\n\n"
-            f"📏 Khoảng cách: {round(distance)}m\n"
-            f"📍 Địa điểm họp: {office_location.name}\n"
-            f"🎯 Bán kính cho phép: {office_location.radius}m\n\n"
-            f"🏃‍♂️ Di chuyển lại gần đi bro!\n"
-            f"🧋 Bot chỉ ngửi thấy mùi trà sữa, không thấy phòng họp!",
-            reply_markup=Keyboards.main_menu()
-        )
-        return
-    
-    # =================================================================
-    # PROCESS CHECK-IN OR CHECK-OUT
-    # =================================================================
-    
-    if action == "checkin":
-        await process_checkin(
-            message, user_id, office_location, 
-            user_lat, user_lon, distance
-        )
-    elif action == "checkout":
-        await process_checkout(
-            message, user_id, office_location,
-            user_lat, user_lon, distance
-        )
-
-
-async def process_checkin(
-    message: Message,
-    user_id: int,
-    location: Location,
-    user_lat: float,
-    user_lon: float,
-    distance: float
-) -> None:
-    """
-    Process a check-in after location validation.
-    """
-    result = AttendanceService.record_checkin(
-        user_id=user_id,
-        location_id=location.id,
-        user_lat=user_lat,
-        user_lon=user_lon,
-        distance=distance
-    )
-    
-    if result.success:
-        if result.is_late:
-            response = (
-                f"⚠️ Điểm danh thành công... nhưng MUỘN rồi bro! 😤\n\n"
-                f"🕐 Time: {result.attendance_log.timestamp.strftime('%H:%M')}\n"
-                f"📍 Location: {location.name}\n"
-                f"📏 Khoảng cách: {round(distance)}m\n"
-                f"⏰ Muộn: {result.late_minutes} phút\n\n"
-                f"🐌 Lần sau đi sớm hơn nha! Chậm như rùa! 💀"
-            )
-        else:
-            response = (
-                f"✅ SHEESH! Điểm danh thành công! 🔥\n\n"
-                f"🕐 Time: {result.attendance_log.timestamp.strftime('%H:%M')}\n"
-                f"📍 Location: {location.name}\n"
-                f"📏 Khoảng cách: {round(distance)}m\n\n"
-                f"💪 Bro chăm xỉu! Based! 🫡"
-            )
+    if ranking:
+        monthly_points = ranking.monthly_points
+        total_points = ranking.total_points
+        rank = ranking.rank
+        rank_title = PointService.get_rank_title(rank)
+        cc_month = PointService.get_monthly_cc_display(monthly_points)
+        cc_term = PointService.get_term_cc_display(ranking.warning_level)
     else:
-        response = f"❌ Oof! {result.message} 💀"
+        monthly_points = 0
+        total_points = 0
+        rank = "-"
+        rank_title = "Chua xep hang"
+        cc_month = PointService.get_monthly_cc_display(0)
+        cc_term = PointService.get_term_cc_display(user_data.warning_level)
     
-    await message.reply_text(
-        response,
-        reply_markup=Keyboards.main_menu()
-    )
-
-
-async def process_checkout(
-    message: Message,
-    user_id: int,
-    location: Location,
-    user_lat: float,
-    user_lon: float,
-    distance: float
-) -> None:
-    """
-    Process a check-out after location validation.
-    """
-    result = AttendanceService.record_checkout(
-        user_id=user_id,
-        location_id=location.id if location else None,
-        user_lat=user_lat,
-        user_lon=user_lon,
-        distance=distance
+    status_text = Messages.STATUS_TEMPLATE.format(
+        name=user_data.full_name,
+        monthly_points=monthly_points,
+        total_points=total_points,
+        rank=rank,
+        rank_title=rank_title,
+        cc_month=cc_month,
+        cc_term=cc_term,
     )
     
-    if result.success:
-        work_hours = AttendanceService.format_duration(result.work_duration)
-        response = (
-            f"✅ NICE! Check-out thành công! 🎉\n\n"
-            f"🕐 Time: {result.attendance_log.timestamp.strftime('%H:%M')}\n"
-            f"⏱️ Thời gian họp: {work_hours}\n\n"
-            f"🛋️ Về chill thôi bro! GG! 🍻✨"
-        )
-    else:
-        response = f"❌ Oof! {result.message} 💀"
-    
-    await message.reply_text(
-        response,
+    await update.message.reply_text(
+        status_text,
         reply_markup=Keyboards.main_menu()
     )
 
@@ -362,130 +483,7 @@ async def cancel_action(
     context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle cancel button press."""
-    user_id = update.effective_user.id
-    
-    # Clear any pending action
-    if user_id in pending_actions:
-        del pending_actions[user_id]
-    
     await update.message.reply_text(
-        "❌ Đã cancel! Nhát quá bro ơi! 😏🐔",
-        reply_markup=Keyboards.main_menu()
-    )
-
-
-async def status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """
-    Handle /status command.
-    
-    Shows user's current attendance status for today.
-    """
-    # Check if muted
-    if await check_muted(update):
-        return
-    
-    user_id = update.effective_user.id
-    user = UserService.get_user(user_id)
-    
-    if not user:
-        await update.message.reply_text(
-            "🤔 Ủa bro chưa đăng ký mà?\n\n"
-            "👆 Dùng /start để đăng ký nha!"
-        )
-        return
-    
-    # Get today's attendance
-    attendance = AttendanceService.get_user_attendance_today(user_id)
-    
-    # Build status message
-    user_role = user.role.value if hasattr(user.role, 'value') else str(user.role)
-    user_status = user.status.value if hasattr(user.status, 'value') else str(user.status)
-    role = "👑 Admin" if user_role == "admin" else "👤 Member"
-    status_text = (
-        f"📊 THÔNG TIN TÀI KHOẢN\n\n"
-        f"👤 Name: {user.full_name}\n"
-        f"🎭 Role: {role}\n"
-        f"📋 Status: {user_status}\n"
-        f"📅 Joined: {user.joined_at.strftime('%d/%m/%Y')}"
-    )
-    
-    today_text = f"\n\n🗓️ HÔM NAY ({datetime.now().strftime('%d/%m/%Y')}):\n"
-    
-    if attendance and attendance.check_in_time:
-        checkin_str = attendance.check_in_time.strftime("%H:%M")
-        checkout_str = attendance.check_out_time.strftime("%H:%M") if attendance.check_out_time else "Chưa checkout"
-        
-        today_text += f"  ⏰ Điểm danh: {checkin_str}\n"
-        today_text += f"  🏃 Check-out: {checkout_str}\n"
-        
-        if attendance.is_late:
-            today_text += f"  🐌 Đi muộn: {attendance.late_minutes} phút 💀\n"
-        
-        if attendance.work_duration:
-            duration_str = AttendanceService.format_duration(attendance.work_duration)
-            today_text += f"  ⏱️ Thời gian: {duration_str}"
-        
-        today_text += "\n\n💪 Bro chăm xỉu! Based! 🫡"
-    else:
-        today_text += "  ❌ Chưa điểm danh!\n\n"
-        today_text += "🛏️ Định cúp họp hả? Dậy đi bro! 💀"
-    
-    await update.message.reply_text(
-        f"{status_text}{today_text}",
-        reply_markup=Keyboards.main_menu()
-    )
-
-
-async def history_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """
-    Handle /history command.
-    
-    Shows user's attendance history for the current month.
-    """
-    # Check if muted
-    if await check_muted(update):
-        return
-    
-    user_id = update.effective_user.id
-    user = UserService.get_user(user_id)
-    
-    if not user:
-        await update.message.reply_text(
-            "🤔 Ủa bro chưa đăng ký mà?\n\n"
-            "👆 Dùng /start để đăng ký nha!"
-        )
-        return
-    
-    # Get current month summary
-    now = datetime.now()
-    summary = AttendanceService.get_monthly_summary(
-        user_id, now.year, now.month
-    )
-    
-    history_text = (
-        f"📜 LỊCH SỬ ĐIỂM DANH THÁNG {now.month}/{now.year}\n\n"
-        f"📅 Tổng số ngày họp: {summary['total_days']}\n"
-        f"✅ Số ngày đi họp: {summary['present_days']}\n"
-        f"🐌 Số ngày đi muộn: {summary['late_days']}\n"
-        f"❌ Số ngày cúp họp: {summary['absent_days']}\n"
-        f"⏱️ Tổng giờ họp: {summary['total_work_hours']}h\n"
-        f"📊 Trung bình/ngày: {summary['average_work_hours']}h\n\n"
-    )
-    
-    if summary['absent_days'] > 0:
-        history_text += f"😤 Bro cúp họp {summary['absent_days']} ngày là sao? 💀"
-    elif summary['late_days'] > 0:
-        history_text += f"🐌 Muộn {summary['late_days']} lần rồi đó, cố gắng lên bro! 😏"
-    else:
-        history_text += "💪 Bro chăm xỉu! Perfect attendance! 🔥🫡"
-    
-    await update.message.reply_text(
-        history_text,
+        "Da huy!",
         reply_markup=Keyboards.main_menu()
     )
